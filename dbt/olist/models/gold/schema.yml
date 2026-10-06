@@ -1,0 +1,36 @@
+version: 2
+
+models:
+  - name: gold_revenue_by_state
+    description: >
+      Doanh thu theo bang của khách hàng và theo tháng.
+      silver_order_facts JOIN bronze.customers.
+      Bảng này bị ROW FILTER trong rules.json khi truy vấn bằng user `analyst`.
+    columns:
+      - name: customer_state
+        tests: [not_null]
+      - name: order_month
+        tests: [not_null]
+      - name: revenue
+        tests: [not_null]
+      - name: revenue_rank_in_month
+        description: "rank() theo doanh thu trong từng tháng."
+
+  - name: gold_revenue_by_category
+    description: >
+      Doanh thu theo nhóm hàng (tên tiếng Anh).
+      silver_order_facts JOIN bronze.products + bronze.category_translation.
+    columns:
+      - name: product_category
+        tests: [not_null]
+      - name: revenue_share_pct
+        description: "Tỉ trọng doanh thu nhóm hàng trong tháng, tính bằng window function."
+
+  - name: gold_seller_scorecard
+    description: >
+      Xếp hạng người bán: silver_order_facts JOIN bronze.sellers + bronze.products.
+    columns:
+      - name: seller_id
+        tests: [not_null, unique]
+      - name: revenue_quartile
+        description: "ntile(4) theo doanh thu."

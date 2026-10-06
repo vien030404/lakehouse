@@ -1,0 +1,95 @@
+{
+  "catalogs": [
+    { "user": "admin",   "allow": "all" },
+    { "user": "analyst", "catalog": "system",    "allow": "read-only" },
+    { "user": "analyst", "catalog": "lakehouse", "allow": "read-only" },
+    { "user": "analyst", "catalog": "tpch",      "allow": "read-only" },
+    { "user": ".*",      "catalog": ".*",        "allow": "none" }
+  ],
+
+  "schemas": [
+    { "user": "admin", "schema": ".*", "owner": true },
+    { "user": ".*",    "schema": ".*", "owner": false }
+  ],
+
+  "tables": [
+    {
+      "user": "admin",
+      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]
+    },
+    {
+      "user": "analyst",
+      "catalog": "lakehouse",
+      "schema": "gold",
+      "table": "gold_revenue_by_state",
+      "privileges": ["SELECT"],
+      "filter": "customer_state = 'SP'"
+    },
+    {
+      "user": "analyst",
+      "catalog": "lakehouse",
+      "schema": "gold",
+      "table": ".*",
+      "privileges": ["SELECT"]
+    },
+    {
+      "user": "analyst",
+      "catalog": "lakehouse",
+      "schema": "silver",
+      "table": ".*",
+      "privileges": ["SELECT"],
+      "columns": [
+        {
+          "name": "customer_id",
+          "mask": "concat(substr(customer_id, 1, 4), '****MASKED****')"
+        },
+        {
+          "name": "customer_unique_id",
+          "allow": false
+        }
+      ]
+    },
+    {
+      "user": "analyst",
+      "catalog": "lakehouse",
+      "schema": "bronze",
+      "table": ".*",
+      "privileges": []
+    },
+    { "user": "analyst", "catalog": "tpch",   "privileges": ["SELECT"] },
+    { "user": "analyst", "catalog": "system", "privileges": ["SELECT"] },
+    { "user": ".*", "privileges": [] }
+  ],
+
+  "functions": [
+    { "user": "admin", "privileges": ["EXECUTE", "GRANT_EXECUTE", "OWNERSHIP"] }
+  ],
+
+  "procedures": [
+    { "user": "admin", "privileges": ["EXECUTE", "GRANT_EXECUTE"] }
+  ],
+
+  "system_session_properties": [
+    { "user": "admin", "allow": true },
+    {
+      "user": "analyst",
+      "property": "(query_max_run_time|join_distribution_type|enable_dynamic_filtering)",
+      "allow": true
+    },
+    { "user": ".*", "allow": false }
+  ],
+
+  "catalog_session_properties": [
+    { "user": "admin", "allow": true },
+    { "user": ".*",    "allow": false }
+  ],
+
+  "queries": [
+    { "user": "admin", "allow": ["execute", "view", "kill"] },
+    { "user": ".*",    "allow": ["execute"] }
+  ],
+
+  "system_information": [
+    { "user": "admin", "allow": ["read", "write"] }
+  ]
+}

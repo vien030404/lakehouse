@@ -1,0 +1,60 @@
+version: 2
+
+sources:
+  # -------------------------------------------------------------------------
+  # BRONZE - bảng Iceberg trên MinIO, nguồn duy nhất của dbt.
+  #   9 bảng lịch sử Olist: Spark batch nạp (spark/jobs/ingest_bronze.py)
+  #   5 bảng *_events     : Spark Streaming ghi từ Redpanda (spark/jobs/stream_olist.py)
+  # -------------------------------------------------------------------------
+  - name: bronze
+    database: lakehouse
+    schema: bronze
+    description: "Dữ liệu Olist thô, đã ép kiểu, lưu Iceberg trên MinIO."
+    tables:
+      # --- giao dịch ------------------------------------------------------
+      - name: orders
+        description: "1 dòng = 1 đơn hàng. Partition theo day(order_purchase_timestamp)."
+        columns:
+          - name: order_id
+            tests: [not_null, unique]
+          - name: customer_id
+            tests: [not_null]
+      - name: order_items
+        description: "1 dòng = 1 dòng hàng trong đơn (order_id + order_item_id)."
+        columns:
+          - name: order_id
+            tests: [not_null]
+      - name: payments
+        description: "1 dòng = 1 lượt thanh toán của đơn."
+      - name: reviews
+        description: "Đánh giá của khách sau khi nhận hàng."
+
+      # --- tham chiếu ------------------------------------------------------
+      - name: customers
+        description: "1 dòng = 1 customer_id (một người mua có thể có nhiều customer_id)."
+        columns:
+          - name: customer_id
+            tests: [not_null, unique]
+      - name: sellers
+        description: "1 dòng = 1 người bán."
+      - name: geolocation
+        description: "Toạ độ theo mã bưu chính, 1.000.163 dòng. Chưa model nào dùng."
+      - name: products
+        description: "Danh mục sản phẩm."
+        columns:
+          - name: product_id
+            tests: [not_null, unique]
+      - name: category_translation
+        description: "Tên nhóm hàng tiếng Bồ -> tiếng Anh."
+
+      # --- luồng stream (Spark ghi từ Redpanda, xem spark/jobs/stream_olist.py)
+      - name: customer_events
+        description: "Khách mới do datagen sinh. Nhật ký chỉ-thêm, có cột ingest_ts làm mốc cắt."
+      - name: order_events
+        description: "Mỗi lần đơn đổi trạng thái = 1 dòng mang TOÀN BỘ trạng thái sau thay đổi + seq."
+      - name: order_item_events
+        description: "Dòng hàng của đơn mới."
+      - name: payment_events
+        description: "Thanh toán, sinh lúc đơn được duyệt."
+      - name: review_events
+        description: "Đánh giá, sinh sau khi giao (hoặc sau khi huỷ)."

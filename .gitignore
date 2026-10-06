@@ -1,0 +1,24 @@
+# Dataset Olist - tải từ Kaggle (xem README), không đưa vào repo
+data/*.csv
+data/*.zip
+
+# Biến môi trường thật; .env.example là bản mẫu
+.env
+
+# Artifact sinh ra khi chạy dbt
+dbt/olist/target/
+dbt/olist/dbt_packages/
+dbt/olist/logs/
+dbt/olist/.user.yml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

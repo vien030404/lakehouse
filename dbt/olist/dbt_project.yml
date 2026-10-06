@@ -1,0 +1,45 @@
+name: olist
+version: "1.0.0"
+config-version: 2
+
+profile: olist
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+# Biến dùng chung cho các model. Airflow truyền thêm cutoff_ts và
+# prev_cutoff_ts qua --vars (xem macros/stream_cutoff.sql).
+vars:
+  # Cửa sổ (ngày, theo order_purchase_timestamp) mà silver_order_facts quét
+  # lại ở mỗi lần chạy incremental
+  incremental_lookback_days: 7
+  # Trạng thái đơn được ghi nhận doanh thu ở hai bảng gold doanh thu
+  revenue_order_statuses: ["delivered", "shipped", "invoiced"]
+  # Trạng thái coi là đã hoàn thành - dùng cho gold_seller_scorecard
+  completed_order_statuses: ["delivered"]
+
+models:
+  olist:
+    +materialized: table
+    # Mọi bảng dbt tạo ra nằm trong catalog Iceberg `lakehouse` (xem profiles.yml)
+    silver:
+      +schema: silver
+      +materialized: table
+    gold:
+      +schema: gold
+      +materialized: table
+
+snapshots:
+  olist:
+    +target_schema: silver
+    +schema: silver
+
+tests:
+  olist:
+    +store_failures: false

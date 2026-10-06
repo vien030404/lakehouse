@@ -1,0 +1,56 @@
+version: 2
+
+models:
+  - name: silver_customers
+    description: "Khách: lịch sử Olist + khách mới từ luồng stream (bronze.customer_events)."
+    columns:
+      - name: customer_id
+        tests:
+          - not_null
+          - unique
+
+  - name: silver_orders
+    description: "Đơn hàng đã làm sạch, partition theo tháng mua."
+    columns:
+      - name: order_id
+        description: "Khoá đơn hàng (chuỗi hash, varchar)."
+        tests:
+          - not_null
+          - unique
+      - name: customer_id
+        tests: [not_null]
+      - name: order_status
+        tests:
+          - accepted_values:
+              values: [delivered, shipped, invoiced, processing, canceled, unavailable, created, approved]
+      - name: order_purchase_timestamp
+        tests: [not_null]
+
+  - name: silver_payments
+    description: "Một dòng / đơn: tổng tiền và phương thức thanh toán chính."
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+          - unique
+      - name: payment_total
+        tests: [not_null]
+
+  - name: silver_order_facts
+    description: >
+      Bảng sự kiện incremental (merge). Hạt: 1 dòng / dòng hàng.
+      Đã join sẵn orders + order_items + payments + reviews.
+    tests:
+      # generic test tự viết trong macros/ - không cần cài package dbt_utils
+      - unique_combination_of_columns:
+          combination_of_columns: [order_id, order_item_id]
+    columns:
+      - name: order_id
+        tests: [not_null]
+      - name: order_item_id
+        tests: [not_null]
+      - name: item_revenue
+        tests: [not_null]
+      - name: customer_id
+        description: "Bị column mask khi truy vấn bằng user `analyst`."
+        tests: [not_null]

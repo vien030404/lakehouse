@@ -1,0 +1,22 @@
+# ---------------------------------------------------------------------------
+# Kết nối dbt -> Trino. File nằm trong project để container dbt và Airflow
+# cùng dùng một cấu hình (DBT_PROFILES_DIR trỏ vào thư mục project). Thông số
+# kết nối lấy từ biến môi trường, có giá trị mặc định cho mạng docker-compose.
+# ---------------------------------------------------------------------------
+olist:
+  target: dev
+  outputs:
+    dev:
+      type: trino
+      method: none                       # môi trường local: không xác thực, HTTP
+      user: "{{ env_var('TRINO_USER', 'admin') }}"
+      host: "{{ env_var('TRINO_HOST', 'trino-coordinator') }}"
+      port: "{{ env_var('TRINO_PORT', '8080') | int }}"
+      catalog: "{{ env_var('TRINO_CATALOG', 'lakehouse') }}"
+      schema: silver
+      http_scheme: http
+      threads: 2                         # số model chạy song song; resource group etl giới hạn tiếp phía Trino
+      timezone: UTC
+      retries: 3
+      session_properties:
+        query_max_run_time: 30m

@@ -1,0 +1,672 @@
+# ===========================================================================
+# TrinoDemo - lakehouse pipeline Olist: Spark + Trino + Iceberg + Redpanda + Airflow
+#
+#   docker compose --profile core up -d      # hạ tầng lakehouse + cụm Trino
+#   docker compose --profile spark up -d     # hạ tầng + cụm Spark Standalone
+#   docker compose --profile stream up -d    # toàn bộ luồng stream + Airflow
+#   docker compose --profile full up -d      # core + Superset
+#
+#   Nạp dữ liệu lịch sử bằng Spark:
+#   docker compose run --rm spark-submit jobs/land_raw.py        # data/ -> s3://raw
+#   docker compose run --rm spark-submit jobs/ingest_bronze.py   # raw -> bronze
+#
+#   Công cụ chạy theo yêu cầu (profile tools, tự xoá khi xong):
+#   docker compose run --rm dbt build
+#   docker compose run --rm trino-cli
+#
+# Profile: các service hạ tầng mang nhiều profile để mọi cách khởi động đều
+# kéo theo phần nền cần thiết; `docker compose run` cũng tự bật các service
+# phụ thuộc và chờ chúng healthy.
+#
+# Đặt tên: container_name có tiền tố `trinodemo-` để không trùng với project
+# khác trên cùng Docker host. Tên service (minio, trino-coordinator, ...) giữ
+# ngắn vì đó là hostname trong network `trinonet` mà mọi file cấu hình trỏ tới.
+# ===========================================================================
+
+x-trino-common: &trino-common
+  image: trinodb/trino:${TRINO_VERSION}
+  environment:
+    MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+    MINIO_REGION: ${MINIO_REGION}
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    TRINO_RETRY_POLICY: ${TRINO_RETRY_POLICY}
+  networks: [trinonet]
+
+x-spark-common: &spark-common
+  build:
+    context: ./spark
+    args:
+      SPARK_VERSION: ${SPARK_VERSION}
+  image: trinodemo/spark:${SPARK_VERSION}
+  environment:
+    # S3FileIO (Iceberg) và s3a (Hadoop) đều đọc thông tin xác thực từ biến
+    # môi trường. Executor là tiến trình con của worker nên thừa hưởng chúng.
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    AWS_REGION: ${MINIO_REGION}
+    # Heap của tiến trình daemon master/worker (không phải executor). Daemon
+    # chỉ giữ trạng thái cụm nên không cần mức mặc định 1g.
+    SPARK_DAEMON_MEMORY: 384m
+  networks: [trinonet]
+
+services:
+
+  # =========================================================================
+  # LAKEHOUSE + TRINO
+  # =========================================================================
+
+  minio:
+    image: quay.io/minio/minio:${MINIO_VERSION}
+    container_name: trinodemo-minio
+    profiles: [core, full, tools, spark, stream]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_REGION: ${MINIO_REGION}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    # Luồng stream tạo nhiều request S3 nhỏ (mỗi lô vài commit Iceberg) bên
+    # cạnh truy vấn Trino; 1g giữ MinIO không bị nghẽn bộ nhớ.
+    mem_limit: 1g
+    cpus: 0.2
+    networks: [trinonet]
+
+  # Job một lần: tạo 4 bucket (lakehouse, raw, exchange, checkpoints) rồi thoát.
+  # --ignore-existing nên idempotent. Dùng `mc` có sẵn trong image minio.
+  minio-init:
+    image: quay.io/minio/minio:${MINIO_VERSION}
+    container_name: trinodemo-minio-init
+    profiles: [core, full, tools, spark, stream]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+        mc mb --ignore-existing local/${LAKEHOUSE_BUCKET} local/${RAW_BUCKET} local/${EXCHANGE_BUCKET} local/${CHECKPOINT_BUCKET}
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    restart: "no"
+    networks: [trinonet]
+
+  iceberg-rest:
+    build:
+      context: ./iceberg-rest
+      args:
+        ICEBERG_REST_VERSION: ${ICEBERG_REST_VERSION}
+    image: trinodemo/iceberg-rest:${ICEBERG_REST_VERSION}
+    container_name: trinodemo-iceberg-rest
+    profiles: [core, full, tools, spark, stream]
+    depends_on:
+      minio:
+        condition: service_healthy
+      postgres-ops:
+        condition: service_healthy
+    environment:
+      # Backend của REST catalog là PostgreSQL thay vì SQLite mặc định:
+      # SQLite chỉ cho một writer tại một thời điểm, trong khi dbt (nhiều
+      # thread), Spark Streaming và bảo trì của Airflow commit Iceberg đồng
+      # thời. Lý do chi tiết ở iceberg-rest/Dockerfile.
+      #
+      # `iceberg_catalog` là POSTGRES_DB của container postgres-ops (xem .env),
+      # nên Postgres tự tạo nó ở lần khởi động đầu trên volume trống.
+      CATALOG_URI: jdbc:postgresql://postgres-ops:5432/iceberg_catalog
+      CATALOG_JDBC_USER: ${POSTGRES_OPS_USER}
+      CATALOG_JDBC_PASSWORD: ${POSTGRES_OPS_PASSWORD}
+      CATALOG_WAREHOUSE: s3://${LAKEHOUSE_BUCKET}/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: ${MINIO_ENDPOINT}
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: ${MINIO_REGION}
+    ports:
+      - "8181:8181"
+    mem_limit: 512m
+    cpus: 0.2
+    networks: [trinonet]
+
+  # postgres-ops chỉ phục vụ hạ tầng: database `iceberg_catalog` (con trỏ
+  # metadata Iceberg) và `airflow` (metadata Airflow). Dữ liệu nghiệp vụ nằm
+  # hoàn toàn trong lakehouse.
+  postgres-ops:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: trinodemo-postgres-ops
+    profiles: [core, full, tools, spark, stream]
+    environment:
+      POSTGRES_DB: ${POSTGRES_OPS_DB}
+      POSTGRES_USER: ${POSTGRES_OPS_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_OPS_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-ops-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 1g
+    cpus: 0.3
+    networks: [trinonet]
+
+
+  trino-coordinator:
+    <<: *trino-common
+    container_name: trinodemo-trino-coordinator
+    profiles: [core, full, tools, stream]
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      iceberg-rest:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/coordinator/config.properties:/etc/trino/config.properties:ro
+      - ./trino/coordinator/jvm.config:/etc/trino/jvm.config:ro
+      - ./trino/coordinator/node.properties:/etc/trino/node.properties:ro
+      - ./trino/coordinator/log.properties:/etc/trino/log.properties:ro
+      - ./trino/coordinator/exchange-manager.properties:/etc/trino/exchange-manager.properties:ro
+      - ./trino/coordinator/access-control.properties:/etc/trino/access-control.properties:ro
+      - ./trino/coordinator/resource-groups.properties:/etc/trino/resource-groups.properties:ro
+      - ./trino/coordinator/resource-groups.json:/etc/trino/resource-groups.json:ro
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - ./trino/security:/etc/trino/security:ro
+      - trino-coordinator-data:/data/trino
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/v1/info | grep -q '\"starting\":false'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    mem_limit: 3g
+    cpus: 0.5
+
+  trino-worker-1:
+    <<: *trino-common
+    container_name: trinodemo-trino-worker-1
+    profiles: [core, full, tools, stream]
+    depends_on:
+      trino-coordinator:
+        condition: service_started
+    volumes:
+      - ./trino/worker/config.properties:/etc/trino/config.properties:ro
+      - ./trino/worker/jvm.config:/etc/trino/jvm.config:ro
+      - ./trino/worker/node.properties:/etc/trino/node.properties:ro
+      - ./trino/worker/log.properties:/etc/trino/log.properties:ro
+      - ./trino/worker/exchange-manager.properties:/etc/trino/exchange-manager.properties:ro
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - trino-worker-1-data:/data/trino
+    mem_limit: 4g
+    cpus: 1.0
+
+  trino-worker-2:
+    <<: *trino-common
+    container_name: trinodemo-trino-worker-2
+    profiles: [core, full, tools, stream]
+    depends_on:
+      trino-coordinator:
+        condition: service_started
+    volumes:
+      - ./trino/worker/config.properties:/etc/trino/config.properties:ro
+      - ./trino/worker/jvm.config:/etc/trino/jvm.config:ro
+      - ./trino/worker/node.properties:/etc/trino/node.properties:ro
+      - ./trino/worker/log.properties:/etc/trino/log.properties:ro
+      - ./trino/worker/exchange-manager.properties:/etc/trino/exchange-manager.properties:ro
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - trino-worker-2-data:/data/trino
+    mem_limit: 4g
+    cpus: 1.0
+
+  # =========================================================================
+  # SPARK STANDALONE - 1 master + 2 worker
+  #
+  # Spark đưa dữ liệu vào lakehouse: job batch nạp CSV lịch sử vào bronze,
+  # job streaming ghi sự kiện từ Redpanda. Silver, gold và truy vấn do
+  # dbt + Trino đảm nhiệm.
+  #
+  #   spark-master     cluster manager: cấp core/RAM cho ứng dụng, không chạm dữ liệu
+  #   spark-worker-N   khởi động executor (nơi đọc/ghi dữ liệu) khi được cấp
+  #   spark-submit     driver của job batch (client mode), chạy theo yêu cầu
+  #   spark-streaming  driver của job streaming, chạy thường trực
+  # =========================================================================
+
+  spark-master:
+    <<: *spark-common
+    container_name: trinodemo-spark-master
+    profiles: [spark, tools, stream]
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      iceberg-rest:
+        condition: service_started
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "8082:8080"   # UI master (cổng 8080 của host dành cho Trino)
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/json/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    mem_limit: 768m
+    cpus: 0.3
+
+  spark-worker-1:
+    <<: *spark-common
+    container_name: trinodemo-spark-worker-1
+    profiles: [spark, tools, stream]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    # --cores / --memory: tài nguyên worker cấp cho executor (không phải cho
+    # tiến trình worker). 1 core + 1g = đúng một executor theo
+    # spark.executor.cores=1, spark.executor.memory=1g.
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --cores
+      - "1"
+      - --memory
+      - 1g
+      - --webui-port
+      - "8081"
+      - --work-dir
+      - /tmp/spark-work
+    ports:
+      - "8083:8081"
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    # 384m heap daemon + 1g heap executor + bộ nhớ ngoài heap của hai JVM
+    mem_limit: 2g
+    cpus: 1.0
+
+  spark-worker-2:
+    <<: *spark-common
+    container_name: trinodemo-spark-worker-2
+    profiles: [spark, tools, stream]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --cores
+      - "1"
+      - --memory
+      - 1g
+      - --webui-port
+      - "8081"
+      - --work-dir
+      - /tmp/spark-work
+    ports:
+      - "8084:8081"
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    mem_limit: 2g
+    cpus: 1.0
+
+  # =========================================================================
+  # LUỒNG STREAM - dữ liệu thay đổi liên tục
+  #
+  #   datagen ──► redpanda ──► spark-streaming ──► bronze.*_events + silver.orders_live
+  #                                                        │
+  #   airflow (00:00 hằng ngày) ── dbt trên Trino ──► silver chuẩn + gold
+  #
+  # Mỗi thành phần giữ trạng thái bền của riêng nó: datagen giữ đồng hồ mô
+  # phỏng và outbox trên volume, Redpanda giữ sự kiện chưa đọc, Spark giữ
+  # offset trong checkpoint trên MinIO. Dừng và khởi động lại ở bất kỳ thời
+  # điểm nào không làm mất, lặp sự kiện hay méo thời gian nghiệp vụ.
+  # =========================================================================
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION}
+    container_name: trinodemo-redpanda
+    profiles: [stream]
+    command:
+      - redpanda
+      - start
+      - --mode
+      - dev-container
+      # 1 shard, 1 GB, không ghim CPU (--overprovisioned) - đủ cho môi trường local
+      - --smp
+      - "1"
+      - --memory
+      - 1G
+      - --overprovisioned
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr
+      - redpanda:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+    ports:
+      - "19092:19092"   # Kafka API cho công cụ chạy trên host
+      - "9644:9644"     # Admin API
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -qE 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    mem_limit: 1536m
+    cpus: 0.5
+    networks: [trinonet]
+
+  # Job một lần: tạo 6 topic nếu chưa có, mỗi topic 2 partition. Retention 30
+  # ngày để consumer dừng lâu vẫn đọc tiếp được. olist.customers dùng log
+  # compaction vì mỗi khách chỉ cần bản ghi mới nhất.
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION}
+    container_name: trinodemo-redpanda-init
+    profiles: [stream]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        B="-X brokers=redpanda:9092"
+        for t in olist.orders olist.order_items olist.payments olist.reviews olist.datagen_params; do
+          rpk topic describe $$t $$B >/dev/null 2>&1 || rpk topic create $$t $$B -p 2 -c retention.ms=2592000000
+        done
+        rpk topic describe olist.customers $$B >/dev/null 2>&1 || rpk topic create olist.customers $$B -p 2 -c cleanup.policy=compact
+        rpk topic list $$B
+    restart: "no"
+    networks: [trinonet]
+
+  datagen:
+    build:
+      context: ./datagen
+    image: trinodemo/datagen:1.0
+    container_name: trinodemo-datagen
+    profiles: [stream]
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      trino-coordinator:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      TIME_SCALE: ${TIME_SCALE}
+      SIM_START: ${SIM_START}
+      TRINO_HOST: trino-coordinator
+    volumes:
+      # đồng hồ mô phỏng, đơn đang dở, outbox; xoá volume = bắt đầu lại từ SIM_START
+      - datagen-state:/state
+      # kịch bản tham số, được đọc lại mỗi khi sang ngày mô phỏng mới
+      - ./datagen/scenario.yml:/app/scenario.yml:ro
+    restart: unless-stopped
+    mem_limit: 384m
+    cpus: 0.2
+    networks: [trinonet]
+
+  # Driver của job streaming: chạy thường trực, tự khởi động lại khi lỗi.
+  # spark.cores.max=1 -> chỉ giữ một executor, executor còn lại dành cho job batch.
+  spark-streaming:
+    <<: *spark-common
+    container_name: trinodemo-spark-streaming
+    profiles: [stream]
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      spark-worker-1:
+        condition: service_started
+      spark-worker-2:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: ${MINIO_REGION}
+      KAFKA_BOOTSTRAP: redpanda:9092
+      STREAM_TRIGGER: ${STREAM_TRIGGER}
+      STREAM_CHECKPOINT: s3a://${CHECKPOINT_BUCKET}/stream_olist
+    entrypoint:
+      - /bin/sh
+      - -c
+      - exec /opt/spark/bin/spark-submit --conf spark.driver.host=$$(hostname -i) "$$@"
+      - spark-submit
+    command: ["--conf", "spark.cores.max=1", "--conf", "spark.sql.shuffle.partitions=2",
+              "jobs/stream_olist.py"]
+    ports:
+      - "4040:4040"   # UI của driver: tab Structured Streaming
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./spark/jobs:/opt/spark/work-dir/jobs:ro
+    restart: unless-stopped
+    mem_limit: 1536m
+    cpus: 0.5
+
+  # Chốt dữ liệu stream hằng ngày vào silver chuẩn và gold (dags/olist_daily.py).
+  # Standalone: api-server, scheduler, dag-processor, triggerer trong một
+  # container. Metadata ở database `airflow` trên postgres-ops (start.sh tạo).
+  # dbt chạy ngay trong container này (venv riêng), không cần docker.sock.
+  airflow:
+    build:
+      context: ./airflow
+      args:
+        AIRFLOW_VERSION: ${AIRFLOW_VERSION}
+    image: trinodemo/airflow:${AIRFLOW_VERSION}
+    container_name: trinodemo-airflow
+    profiles: [stream]
+    depends_on:
+      postgres-ops:
+        condition: service_healthy
+      trino-coordinator:
+        condition: service_healthy
+    command: ["bash", "/opt/airflow/start.sh"]
+    environment:
+      PG_USER: ${POSTGRES_OPS_USER}
+      PG_PASSWORD: ${POSTGRES_OPS_PASSWORD}
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_OPS_USER}:${POSTGRES_OPS_PASSWORD}@postgres-ops:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+      # Môi trường local: UI không yêu cầu đăng nhập
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "True"
+      # Tối đa 2 task song song; SQL nặng chạy trên Trino, không trong Airflow
+      AIRFLOW__CORE__PARALLELISM: "2"
+    ports:
+      - "8090:8080"   # UI Airflow (8080 dành cho Trino, 8082-8084 cho Spark)
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/start.sh:/opt/airflow/start.sh:ro
+      - ./dbt:/opt/dbt
+      - airflow-logs:/opt/airflow/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/v2/monitor/health >/dev/null"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 90s
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 0.5
+    networks: [trinonet]
+
+  # =========================================================================
+  # BI
+  # =========================================================================
+
+  superset:
+    build:
+      context: ./superset
+      args:
+        SUPERSET_VERSION: ${SUPERSET_VERSION}
+    image: trinodemo/superset:${SUPERSET_VERSION}
+    container_name: trinodemo-superset
+    profiles: [full]
+    depends_on:
+      trino-coordinator:
+        condition: service_started
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      PYTHONPATH: /app/pythonpath
+      # Một worker gunicorn nhiều thread: đủ cho số người dùng local, tiết kiệm RAM
+      SERVER_WORKER_AMOUNT: "1"
+      SERVER_THREADS_AMOUNT: "8"
+      GUNICORN_TIMEOUT: "300"
+      TRINO_HOST: trino-coordinator
+      TRINO_PORT: "8080"
+      TRINO_USER: admin
+    ports:
+      - "8088:8088"
+    volumes:
+      - superset-home:/app/superset_home
+    command: ["bash", "/app/entrypoint-superset.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8088/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    mem_limit: 1536m
+    cpus: 0.4
+    networks: [trinonet]
+
+  # =========================================================================
+  # CÔNG CỤ CHẠY THEO YÊU CẦU
+  #
+  # Các service profile `tools` không chạy nền: `docker compose up` bỏ qua
+  # chúng; chỉ khởi động khi gọi `run` và tự xoá khi xong nhờ `--rm`.
+  #
+  #   docker compose run --rm dbt run
+  #   docker compose run --rm dbt test
+  #   docker compose run --rm dbt snapshot
+  #   docker compose run --rm dbt build           # run + test + snapshot
+  #
+  #   docker compose run --rm trino-cli                     # tương tác, user admin
+  #   docker compose run --rm trino-cli-analyst             # tương tác, user analyst
+  #   docker compose run --rm trino-cli --execute "SHOW CATALOGS"
+  #   docker compose run --rm trino-cli -f /sql/maintenance/iceberg_maintenance.sql
+  # =========================================================================
+
+  dbt:
+    build:
+      context: ./dbt
+    image: trinodemo/dbt:1.10
+    profiles: [tools]
+    depends_on:
+      trino-coordinator:
+        condition: service_healthy
+    environment:
+      TRINO_HOST: trino-coordinator
+      TRINO_PORT: "8080"
+      TRINO_USER: admin
+      TRINO_CATALOG: lakehouse
+    volumes:
+      # Bind mount: thay đổi model trên host có hiệu lực ngay, và target/,
+      # logs/ của dbt còn lại sau khi container bị xoá.
+      - ./dbt:/dbt
+    networks: [trinonet]
+
+  # Hai service CLI với danh tính cố định (admin, analyst) - hai vai trong
+  # sql/demo/08_security.sql. `--user` nằm trong entrypoint vì Trino CLI không
+  # cho truyền lại tham số này ở dòng lệnh.
+  trino-cli:
+    image: trinodb/trino:${TRINO_VERSION}
+    profiles: [tools]
+    depends_on:
+      trino-coordinator:
+        condition: service_healthy
+    entrypoint: ["trino", "--server", "http://trino-coordinator:8080", "--user", "admin"]
+    volumes:
+      - ./sql:/sql:ro
+    networks: [trinonet]
+
+  trino-cli-analyst:
+    image: trinodb/trino:${TRINO_VERSION}
+    profiles: [tools]
+    depends_on:
+      trino-coordinator:
+        condition: service_healthy
+    entrypoint: ["trino", "--server", "http://trino-coordinator:8080", "--user", "analyst"]
+    volumes:
+      - ./sql:/sql:ro
+    networks: [trinonet]
+
+  # Driver của job batch (client mode). Executor trên worker kết nối ngược về
+  # driver, nên spark.driver.host phải là địa chỉ worker truy cập được.
+  # `docker compose run` đặt tên container ngẫu nhiên, vì vậy entrypoint điền
+  # IP của container lúc chạy. `$$` là `$` được escape cho compose để shell
+  # trong container thực hiện phép thay thế.
+  spark-submit:
+    <<: *spark-common
+    profiles: [tools]
+    depends_on:
+      spark-worker-1:
+        condition: service_started
+      spark-worker-2:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - exec /opt/spark/bin/spark-submit --conf spark.driver.host=$$(hostname -i) "$$@"
+      - spark-submit
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./spark/jobs:/opt/spark/work-dir/jobs:ro
+      # CSV gốc chỉ driver cần (land_raw.py chép lên s3://raw); worker đọc từ
+      # s3://raw nên không mount.
+      - ./data:/opt/spark/work-dir/data:ro
+    mem_limit: 1536m
+    cpus: 0.5
+
+networks:
+  trinonet:
+    name: trinonet
+    driver: bridge
+
+volumes:
+  minio-data:
+  postgres-ops-data:
+  trino-coordinator-data:
+  trino-worker-1-data:
+  trino-worker-2-data:
+  superset-home:
+  redpanda-data:
+  datagen-state:
+  airflow-logs:

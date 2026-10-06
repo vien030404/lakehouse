@@ -1,0 +1,4 @@
+# Mọi file văn bản giữ LF: script shell, cấu hình Trino/Spark được mount
+# thẳng vào container Linux - CRLF làm hỏng healthcheck và entrypoint.
+* text=auto eol=lf
+*.ps1 text eol=crlf

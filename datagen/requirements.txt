@@ -1,0 +1,4 @@
+confluent-kafka==2.15.1
+faker==40.40.0
+trino==0.340.0
+pyyaml==6.0.3

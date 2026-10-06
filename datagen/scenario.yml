@@ -1,0 +1,60 @@
+# ===========================================================================
+# Kịch bản sinh dữ liệu cho datagen. File được đọc lại mỗi khi sang ngày mô
+# phỏng mới, nên thay đổi có hiệu lực mà không cần khởi động lại container.
+#
+# Mỗi tham số được tính theo ngày mô phỏng:
+#   giá_trị = base × weekday[thứ] × (1 + trend_per_30d)^(số_ngày/30)
+#             × exp(nhiễu) × hệ số chiến dịch,  rồi kẹp trong [min, max]
+#
+#   weekday : 7 hệ số, Thứ Hai -> Chủ Nhật
+#   noise   : độ lệch chuẩn của nhiễu (thang log). Nhiễu là quá trình AR(1)
+#             với hệ số 0,8, nên giá trị trôi dần theo ngày thay vì dao động
+#             ngẫu nhiên độc lập. Seed = seed + tên tham số + ngày, nên cùng
+#             một ngày luôn cho cùng giá trị (tái lập được).
+#
+# base đo từ dữ liệu Olist thật trong lakehouse.bronze; biên min/max lấy theo
+# dao động giữa các tháng 2017-03..2018-08:
+#   huỷ 0,19% -> 1,29%   unavailable 0,06% -> 1,29%   mua lại 1,49% -> 3,72%
+# ===========================================================================
+
+seed: 42
+
+params:
+  orders_per_day:       {base: 222,    min: 120,    max: 400,   noise: 0.12, weekday: [1.05, 1.08, 1.04, 1.0, 0.98, 0.85, 0.9], trend_per_30d: 0.01}
+  repeat_buyer_rate:    {base: 0.031,  min: 0.010,  max: 0.080, noise: 0.15, trend_per_30d: 0.01}
+  cancel_rate:          {base: 0.0063, min: 0.0015, max: 0.020, noise: 0.35}
+  unavailable_rate:     {base: 0.0061, min: 0.0005, max: 0.020, noise: 0.45}
+  approve_delay_min:    {base: 21,     min: 5,      max: 240,   noise: 0.20, weekday: [1, 1, 1, 1, 1.1, 1.6, 1.8]}
+  carrier_delay_h:      {base: 43,     min: 12,     max: 168,   noise: 0.20, weekday: [1, 1, 1, 1, 1.1, 1.5, 1.6]}
+  delivery_delay_h:     {base: 171,    min: 48,     max: 600,   noise: 0.20}
+  estimated_delivery_d: {base: 23,     min: 10,     max: 45,    noise: 0.10}
+  price_multiplier:     {base: 1.0,    min: 0.7,    max: 2.0,   noise: 0.03, trend_per_30d: 0.005}
+  review_rate:          {base: 0.99,   min: 0.80,   max: 1.0}
+
+# Phân phối rời rạc (đo từ bronze). Chiến dịch nhân vào từng khoá bằng
+# "<tên>.<khoá>", rồi chuẩn hoá lại cho tổng = 1.
+mixes:
+  items_per_order:    {1: 0.901, 2: 0.076, 3: 0.013, 4: 0.005, 5: 0.002}
+  payments_per_order: {1: 0.970, 2: 0.024, 3: 0.003}
+  payment_type:       {credit_card: 0.739, boleto: 0.190, voucher: 0.056, debit_card: 0.015}
+  # review_score không khai ở đây: datagen đo hai phân phối riêng từ bronze
+  # cho đơn giao đúng hạn và đơn giao trễ, nên đơn trễ tự có điểm thấp hơn.
+
+comment_rate: {title: 0.117, message: 0.413}
+
+campaigns:
+  - name: black_friday
+    from: 2018-11-23
+    to:   2018-11-26
+    multiply:
+      orders_per_day: 2.0
+      carrier_delay_h: 1.6
+      payment_type.voucher: 2.5
+
+  - name: dinh_cong_van_chuyen
+    from: 2018-12-10
+    to:   2018-12-20
+    multiply:
+      delivery_delay_h: 2.2
+      cancel_rate: 3.0
+      review_score.1: 2.5

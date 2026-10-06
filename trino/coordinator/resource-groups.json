@@ -1,0 +1,59 @@
+{
+  "rootGroups": [
+    {
+      "name": "global",
+      "softMemoryLimit": "90%",
+      "hardConcurrencyLimit": 6,
+      "maxQueued": 50,
+      "schedulingPolicy": "weighted_fair",
+      "subGroups": [
+        {
+          "name": "etl",
+          "softMemoryLimit": "70%",
+          "hardConcurrencyLimit": 3,
+          "maxQueued": 30,
+          "schedulingWeight": 5
+        },
+        {
+          "name": "bi",
+          "softMemoryLimit": "30%",
+          "hardConcurrencyLimit": 2,
+          "maxQueued": 20,
+          "schedulingWeight": 3
+        },
+        {
+          "name": "adhoc",
+          "softMemoryLimit": "30%",
+          "hardConcurrencyLimit": 2,
+          "maxQueued": 20,
+          "schedulingWeight": 2
+        },
+        {
+          "name": "maintenance",
+          "softMemoryLimit": "60%",
+          "hardConcurrencyLimit": 1,
+          "maxQueued": 5,
+          "schedulingWeight": 1
+        }
+      ]
+    }
+  ],
+  "selectors": [
+    {
+      "clientTags": ["maintenance"],
+      "group": "global.maintenance"
+    },
+    {
+      "source": ".*dbt.*",
+      "group": "global.etl"
+    },
+    {
+      "source": ".*(superset|python-client).*",
+      "group": "global.bi"
+    },
+    {
+      "group": "global.adhoc"
+    }
+  ],
+  "cpuQuotaPeriod": "1h"
+}
