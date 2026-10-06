@@ -18,6 +18,12 @@
 # kéo theo phần nền cần thiết; `docker compose run` cũng tự bật các service
 # phụ thuộc và chờ chúng healthy.
 #
+# Khởi động lại: mọi service thường trực mang `restart: unless-stopped`, nên
+# khi Docker khởi động lại, toàn bộ pipeline tự chạy tiếp mà không cần lệnh
+# `up`. Service phụ thuộc chưa sẵn sàng sẽ lỗi rồi được Docker khởi động lại
+# cho tới khi nền tảng bên dưới lên đủ. Job một lần (minio-init,
+# redpanda-init) và công cụ profile `tools` không tự khởi động lại.
+#
 # Đặt tên: container_name có tiền tố `trinodemo-` để không trùng với project
 # khác trên cùng Docker host. Tên service (minio, trino-coordinator, ...) giữ
 # ngắn vì đó là hostname trong network `trinonet` mà mọi file cấu hình trỏ tới.
@@ -78,6 +84,7 @@ services:
       start_period: 15s
     # Luồng stream tạo nhiều request S3 nhỏ (mỗi lô vài commit Iceberg) bên
     # cạnh truy vấn Trino; 1g giữ MinIO không bị nghẽn bộ nhớ.
+    restart: unless-stopped
     mem_limit: 1g
     cpus: 0.2
     networks: [trinonet]
@@ -136,6 +143,7 @@ services:
       AWS_REGION: ${MINIO_REGION}
     ports:
       - "8181:8181"
+    restart: unless-stopped
     mem_limit: 512m
     cpus: 0.2
     networks: [trinonet]
@@ -160,6 +168,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
+    restart: unless-stopped
     mem_limit: 1g
     cpus: 0.3
     networks: [trinonet]
@@ -196,6 +205,7 @@ services:
       timeout: 10s
       retries: 20
       start_period: 60s
+    restart: unless-stopped
     mem_limit: 3g
     cpus: 0.5
 
@@ -214,6 +224,7 @@ services:
       - ./trino/worker/exchange-manager.properties:/etc/trino/exchange-manager.properties:ro
       - ./trino/catalog:/etc/trino/catalog:ro
       - trino-worker-1-data:/data/trino
+    restart: unless-stopped
     mem_limit: 4g
     cpus: 1.0
 
@@ -232,6 +243,7 @@ services:
       - ./trino/worker/exchange-manager.properties:/etc/trino/exchange-manager.properties:ro
       - ./trino/catalog:/etc/trino/catalog:ro
       - trino-worker-2-data:/data/trino
+    restart: unless-stopped
     mem_limit: 4g
     cpus: 1.0
 
@@ -278,6 +290,7 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+    restart: unless-stopped
     mem_limit: 768m
     cpus: 0.3
 
@@ -308,6 +321,7 @@ services:
     volumes:
       - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
     # 384m heap daemon + 1g heap executor + bộ nhớ ngoài heap của hai JVM
+    restart: unless-stopped
     mem_limit: 2g
     cpus: 1.0
 
@@ -334,6 +348,7 @@ services:
       - "8084:8081"
     volumes:
       - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    restart: unless-stopped
     mem_limit: 2g
     cpus: 1.0
 
@@ -563,6 +578,7 @@ services:
       timeout: 10s
       retries: 20
       start_period: 120s
+    restart: unless-stopped
     mem_limit: 1536m
     cpus: 0.4
     networks: [trinonet]
